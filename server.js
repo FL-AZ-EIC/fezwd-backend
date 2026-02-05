@@ -22,7 +22,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Render/Cloud
+  ssl: { rejectUnauthorized: false },
 });
 
 // ---- helpers ------------------------------------------------------
@@ -65,7 +65,10 @@ function verifyHmac(req) {
 }
 
 async function initDb() {
-  // Tabellen anlegen, falls nicht vorhanden
+  // UUID Generator sicherstellen (für gen_random_uuid)
+  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+
+  // Tabellen anlegen (nur wenn nicht vorhanden)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS logs (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -85,6 +88,12 @@ async function initDb() {
       severity TEXT NOT NULL,
       updated_at BIGINT NOT NULL
     );
+  `);
+
+  // Bestehende logs-Tabelle reparieren: Default für id setzen (Altbestand)
+  await pool.query(`
+    ALTER TABLE logs
+    ALTER COLUMN id SET DEFAULT gen_random_uuid();
   `);
 }
 
@@ -108,12 +117,6 @@ async function loadSnapshot() {
   };
 }
 
-async function saveSnapshot(snap) {
-  // Snapshot wird nicht extra gespeichert – wir lesen direkt aus Tabellen.
-  // Funktion bleibt, falls du später Snapshot-Caching machen willst.
-  return snap;
-}
-
 // ---- routes -------------------------------------------------------
 
 app.get("/health", (req, res) => {
@@ -134,59 +137,49 @@ app.post("/api/ingest", async (req, res) => {
   const v = verifyHmac(req);
   if (!v.ok) return res.status(401).json({ ok: false, error: v.error });
 
-  const { component, severity, reason, detail, updatedAt } = req.body || {};
+  try {
+    const { component, severity, reason, detail, updatedAt } = req.body || {};
+    if (!component || !severity) {
+      return res.status(400).json({ ok: false, error: "missing_fields" });
+    }
 
-  if (!component || !severity) {
-    return res.status(400).json({ ok: false, error: "missing_fields" });
+    const ts = Number(updatedAt) || Date.now();
+
+    // Status upsert
+    await pool.query(
+      `
+      INSERT INTO statuses (id, name, detail, severity, updated_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (id) DO UPDATE
+        SET name = EXCLUDED.name,
+            detail = EXCLUDED.detail,
+            severity = EXCLUDED.severity,
+            updated_at = EXCLUDED.updated_at
+      `,
+      [component.toLowerCase(), component, detail || reason || "-", severity, ts]
+    );
+
+    // Log schreiben (mit eigener UUID, damit es auch bei Altbestand nie NULL wird)
+    const logId = crypto.randomUUID();
+    const title = `${component} ${severity}`;
+    const logTitle = reason ? `${title} (${reason})` : title;
+
+    await pool.query(
+      `
+      INSERT INTO logs (id, ts, type, component, title, acknowledged)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [logId, ts, severity, component, logTitle, severity === "ok"]
+    );
+
+    res.json({ ok: true, id: logId });
+  } catch (e) {
+    console.error("ingest error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
   }
-
-  const ts = Number(updatedAt) || Date.now();
-
-  // Status upsert
-  await pool.query(
-    `
-    INSERT INTO statuses (id, name, detail, severity, updated_at)
-    VALUES ($1, $2, $3, $4, $5)
-    ON CONFLICT (id) DO UPDATE
-      SET name = EXCLUDED.name,
-          detail = EXCLUDED.detail,
-          severity = EXCLUDED.severity,
-          updated_at = EXCLUDED.updated_at
-    `,
-    [
-      component.toLowerCase(),
-      component,
-      detail || reason || "-",
-      severity,
-      ts,
-    ]
-  );
-
-  // Log schreiben (acknowledged nur für ok=true)
-  const title = `${component} ${severity}`;
-  await pool.query(
-    `
-    INSERT INTO logs (ts, type, component, title, acknowledged)
-    VALUES ($1, $2, $3, $4, $5)
-    `,
-    [
-      ts,
-      severity,
-      component,
-      reason ? `${title} (${reason})` : title,
-      severity === "ok",
-    ]
-  );
-
-  // Snapshot readback (optional)
-  const snap = await loadSnapshot();
-  await saveSnapshot(snap);
-
-  res.json({ ok: true });
 });
 
-// ✅ NEU: ACK-Endpoint
-// quittiert nur warning/alarm (ok darf NICHT quittierbar sein)
+// ACK: quittiert nur warning/alarm
 app.post("/api/logs/:id/ack", async (req, res) => {
   try {
     const { id } = req.params;

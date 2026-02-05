@@ -31,7 +31,7 @@ function hmacHex(secret, msg) {
   return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 }
 
-function timingSafeEq(a, b) {
+function timingSafeEqHex(a, b) {
   try {
     const ba = Buffer.from(a, "hex");
     const bb = Buffer.from(b, "hex");
@@ -52,7 +52,7 @@ function verifyHmac(req) {
   const tsNum = Number(ts);
   if (!Number.isFinite(tsNum)) return { ok: false, error: "bad_ts" };
 
-  // Timestamp-Toleranz: +/- 120s
+  // +/- 120s Toleranz
   const skew = Math.abs(Date.now() - tsNum);
   if (skew > 120000) return { ok: false, error: "ts_skew" };
 
@@ -60,18 +60,16 @@ function verifyHmac(req) {
   const payload = `${ts}.${nonce}.${body}`;
   const expected = hmacHex(SHARED_SECRET, payload);
 
-  if (!timingSafeEq(expected, sig)) return { ok: false, error: "bad_signature" };
+  if (!timingSafeEqHex(expected, sig)) return { ok: false, error: "bad_signature" };
   return { ok: true };
 }
 
 async function initDb() {
-  // UUID Generator sicherstellen (für gen_random_uuid)
-  await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
-
-  // Tabellen anlegen (nur wenn nicht vorhanden)
+  // Keine Extensions. Keine ALTERs. Nur "create if not exists".
+  // Wichtig: id hat KEIN Default -> wir geben id IMMER beim INSERT mit.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS logs (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      id UUID PRIMARY KEY,
       ts BIGINT NOT NULL,
       type TEXT NOT NULL,
       component TEXT NOT NULL,
@@ -88,12 +86,6 @@ async function initDb() {
       severity TEXT NOT NULL,
       updated_at BIGINT NOT NULL
     );
-  `);
-
-  // Bestehende logs-Tabelle reparieren: Default für id setzen (Altbestand)
-  await pool.query(`
-    ALTER TABLE logs
-    ALTER COLUMN id SET DEFAULT gen_random_uuid();
   `);
 }
 
@@ -159,7 +151,7 @@ app.post("/api/ingest", async (req, res) => {
       [component.toLowerCase(), component, detail || reason || "-", severity, ts]
     );
 
-    // Log schreiben (mit eigener UUID, damit es auch bei Altbestand nie NULL wird)
+    // Log insert (id immer selbst setzen)
     const logId = crypto.randomUUID();
     const title = `${component} ${severity}`;
     const logTitle = reason ? `${title} (${reason})` : title;
@@ -179,7 +171,7 @@ app.post("/api/ingest", async (req, res) => {
   }
 });
 
-// ACK: quittiert nur warning/alarm
+// ACK nur für warning/alarm
 app.post("/api/logs/:id/ack", async (req, res) => {
   try {
     const { id } = req.params;

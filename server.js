@@ -7,52 +7,38 @@ const app = express();
 app.use(cors());
 
 // Raw body für HMAC (wichtig)
-app.use(express.json({
-  limit: "256kb",
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+app.use(
+  express.json({
+    limit: "256kb",
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 const PORT = process.env.PORT || 8787;
 const SHARED_SECRET = process.env.SHARED_SECRET || "change-me";
 const DATABASE_URL = process.env.DATABASE_URL;
 
-let pool = null;
-if (DATABASE_URL) pool = new Pool({ connectionString: DATABASE_URL });
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Render/Cloud
+});
 
-// --- DB init
-async function initDb() {
-  if (!pool) return;
+// ---- helpers ------------------------------------------------------
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS snapshot (
-      id TEXT PRIMARY KEY,
-      generated_at BIGINT NOT NULL,
-      data JSONB NOT NULL
-    );
-  `);
+function hmacHex(secret, msg) {
+  return crypto.createHmac("sha256", secret).update(msg).digest("hex");
+}
 
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS logs (
-      id TEXT PRIMARY KEY,
-      ts BIGINT NOT NULL,
-      type TEXT NOT NULL,
-      component TEXT NOT NULL,
-      title TEXT NOT NULL,
-      acknowledged BOOLEAN NOT NULL
-    );
-  `);
-
-  const r = await pool.query(`SELECT 1 FROM snapshot WHERE id='main'`);
-  if (r.rowCount === 0) {
-    const now = Date.now();
-    const base = {
-      generatedAt: now,
-      statuses: [
-        { id: "internet", name: "Internet", severity: "ok", detail: "—", updatedAt: now }
-      ],
-      logs: []
-    };
-    await pool.query(`INSERT INTO snapshot(id, generated_at, data) VALUES('main', $1, $2)`, [now, base]);
+function timingSafeEq(a, b) {
+  try {
+    const ba = Buffer.from(a, "hex");
+    const bb = Buffer.from(b, "hex");
+    if (ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
+  } catch {
+    return false;
   }
 }
 
@@ -60,114 +46,178 @@ function verifyHmac(req) {
   const ts = req.header("x-ts");
   const nonce = req.header("x-nonce");
   const sig = req.header("x-signature");
-  if (!ts || !nonce || !sig) return { ok: false, reason: "missing_headers" };
 
-  const now = Date.now();
+  if (!ts || !nonce || !sig) return { ok: false, error: "missing_headers" };
+
   const tsNum = Number(ts);
-  if (!Number.isFinite(tsNum) || Math.abs(now - tsNum) > 2 * 60 * 1000) {
-    return { ok: false, reason: "ts_out_of_window" };
-  }
+  if (!Number.isFinite(tsNum)) return { ok: false, error: "bad_ts" };
 
-  const body = req.rawBody ? req.rawBody.toString("utf8") : "";
+  // Timestamp-Toleranz: +/- 120s
+  const skew = Math.abs(Date.now() - tsNum);
+  if (skew > 120000) return { ok: false, error: "ts_skew" };
+
+  const body = (req.rawBody || Buffer.from("")).toString("utf8");
   const payload = `${ts}.${nonce}.${body}`;
+  const expected = hmacHex(SHARED_SECRET, payload);
 
-  const expected = crypto.createHmac("sha256", SHARED_SECRET).update(payload).digest("hex");
-  try {
-    const ok = crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(sig, "hex"));
-    return { ok, reason: ok ? "ok" : "bad_signature" };
-  } catch {
-    return { ok: false, reason: "bad_signature" };
-  }
+  if (!timingSafeEq(expected, sig)) return { ok: false, error: "bad_signature" };
+  return { ok: true };
 }
 
-async function getSnapshot() {
-  const r = await pool.query(`SELECT data FROM snapshot WHERE id='main'`);
-  return r.rows[0].data;
-}
-
-async function saveSnapshot(obj) {
-  const now = Date.now();
-  await pool.query(`UPDATE snapshot SET generated_at=$1, data=$2 WHERE id='main'`, [now, obj]);
-}
-
-async function getLogs() {
-  const r = await pool.query(`SELECT * FROM logs ORDER BY ts DESC LIMIT 200`);
-  return r.rows.map(x => ({
-    id: x.id,
-    timestamp: Number(x.ts),
-    type: x.type,
-    component: x.component,
-    title: x.title,
-    acknowledged: !!x.acknowledged
-  }));
-}
-
-async function addLog({ type, component, title, acknowledged }) {
-  await pool.query(
-    `INSERT INTO logs(id, ts, type, component, title, acknowledged) VALUES($1,$2,$3,$4,$5,$6)`,
-    [crypto.randomUUID(), Date.now(), type, component, title, acknowledged]
-  );
+async function initDb() {
+  // Tabellen anlegen, falls nicht vorhanden
   await pool.query(`
-    DELETE FROM logs
-    WHERE id IN (SELECT id FROM logs ORDER BY ts DESC OFFSET 200)
+    CREATE TABLE IF NOT EXISTS logs (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      ts BIGINT NOT NULL,
+      type TEXT NOT NULL,
+      component TEXT NOT NULL,
+      title TEXT NOT NULL,
+      acknowledged BOOLEAN NOT NULL DEFAULT FALSE
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS statuses (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      detail TEXT NOT NULL DEFAULT '',
+      severity TEXT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
   `);
 }
 
-app.get("/health", (req, res) => res.json({ ok: true, at: Date.now() }));
+async function loadSnapshot() {
+  const logsR = await pool.query(
+    `SELECT id, ts AS "timestamp", type, component, title, acknowledged
+     FROM logs
+     ORDER BY ts DESC
+     LIMIT 200`
+  );
+  const statusesR = await pool.query(
+    `SELECT id, name, detail, severity, updated_at AS "updatedAt"
+     FROM statuses
+     ORDER BY id ASC`
+  );
 
-app.get("/api/snapshot", async (req, res) => {
-  if (!pool) return res.status(500).json({ ok: false, error: "DATABASE_URL not set" });
-  const snap = await getSnapshot();
-  snap.logs = await getLogs();
-  res.json(snap);
-});
+  return {
+    logs: logsR.rows,
+    statuses: statusesR.rows,
+    generatedAt: Date.now(),
+  };
+}
 
-app.post("/api/ingest", async (req, res) => {
-  if (!pool) return res.status(500).json({ ok: false, error: "DATABASE_URL not set" });
+async function saveSnapshot(snap) {
+  // Snapshot wird nicht extra gespeichert – wir lesen direkt aus Tabellen.
+  // Funktion bleibt, falls du später Snapshot-Caching machen willst.
+  return snap;
+}
 
-  const v = verifyHmac(req);
-  if (!v.ok) return res.status(401).json({ ok: false, error: v.reason });
+// ---- routes -------------------------------------------------------
 
-  const { component, severity, reason, detail, updatedAt } = req.body || {};
-  if (!component || !severity) return res.status(400).json({ ok: false, error: "missing_component_or_severity" });
-
-  const snap = await getSnapshot();
-  snap.generatedAt = Date.now();
-
-  const id = String(component).toLowerCase();
-  let st = snap.statuses.find(s => s.id === id);
-  if (!st) {
-    st = { id, name: String(component), severity: "ok", detail: "—", updatedAt: Date.now() };
-    snap.statuses.push(st);
-  }
-
-  const oldKey = `${st.severity}|${st.detail}`;
-  st.severity = severity;
-  st.detail = detail || (reason ? `Grund: ${reason}` : "—");
-  st.updatedAt = updatedAt || Date.now();
-  const newKey = `${st.severity}|${st.detail}`;
-
-  if (newKey !== oldKey) {
-    const type = severity === "alarm" ? "alarm" : (severity === "warning" ? "warning" : "info");
-    const title =
-      severity === "ok" ? `${component} wieder OK`
-      : severity === "alarm" ? `${component} Ausfall`
-      : `${component} eingeschränkt`;
-    await addLog({
-      type,
-      component: String(component),
-      title: reason ? `${title} (${reason})` : title,
-      acknowledged: severity === "ok"
-    });
-  }
-
-  await saveSnapshot(snap);
+app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+app.get("/api/snapshot", async (req, res) => {
+  try {
+    const snap = await loadSnapshot();
+    res.json(snap);
+  } catch (e) {
+    console.error("snapshot error:", e);
+    res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+app.post("/api/ingest", async (req, res) => {
+  const v = verifyHmac(req);
+  if (!v.ok) return res.status(401).json({ ok: false, error: v.error });
+
+  const { component, severity, reason, detail, updatedAt } = req.body || {};
+
+  if (!component || !severity) {
+    return res.status(400).json({ ok: false, error: "missing_fields" });
+  }
+
+  const ts = Number(updatedAt) || Date.now();
+
+  // Status upsert
+  await pool.query(
+    `
+    INSERT INTO statuses (id, name, detail, severity, updated_at)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (id) DO UPDATE
+      SET name = EXCLUDED.name,
+          detail = EXCLUDED.detail,
+          severity = EXCLUDED.severity,
+          updated_at = EXCLUDED.updated_at
+    `,
+    [
+      component.toLowerCase(),
+      component,
+      detail || reason || "-",
+      severity,
+      ts,
+    ]
+  );
+
+  // Log schreiben (acknowledged nur für ok=true)
+  const title = `${component} ${severity}`;
+  await pool.query(
+    `
+    INSERT INTO logs (ts, type, component, title, acknowledged)
+    VALUES ($1, $2, $3, $4, $5)
+    `,
+    [
+      ts,
+      severity,
+      component,
+      reason ? `${title} (${reason})` : title,
+      severity === "ok",
+    ]
+  );
+
+  // Snapshot readback (optional)
+  const snap = await loadSnapshot();
+  await saveSnapshot(snap);
+
+  res.json({ ok: true });
+});
+
+// ✅ NEU: ACK-Endpoint
+// quittiert nur warning/alarm (ok darf NICHT quittierbar sein)
+app.post("/api/logs/:id/ack", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const r = await pool.query(
+      `UPDATE logs
+          SET acknowledged = TRUE
+        WHERE id = $1
+          AND acknowledged = FALSE
+          AND type IN ('warning','alarm')
+        RETURNING id, ts AS "timestamp", type, component, title, acknowledged`,
+      [id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(400).json({ ok: false, error: "not_ackable_or_not_found" });
+    }
+
+    return res.json({ ok: true, log: r.rows[0] });
+  } catch (e) {
+    console.error("ack error:", e);
+    return res.status(500).json({ ok: false, error: "server_error" });
+  }
+});
+
+// ---- start --------------------------------------------------------
+
 initDb()
   .then(() => app.listen(PORT, () => console.log("listening on", PORT)))
-  .catch(err => {
+  .catch((err) => {
     console.error("DB init failed:", err);
     process.exit(1);
   });
+
